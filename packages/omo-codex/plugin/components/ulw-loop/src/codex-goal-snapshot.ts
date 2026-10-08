@@ -66,6 +66,12 @@ function normalizeObjective(value: string): string {
 	return value.replace(/\s+/g, " ").trim();
 }
 
+function normalizeSnapshotPathInput(value: string): string {
+	// fileURL pathname on Windows yields "/C:/..."; resolve() would join it as "<cwd-drive>:/C:/...".
+	if (/^\/[A-Za-z]:(?=\/|\\|$)/.test(value)) return value.slice(1);
+	return value;
+}
+
 export function parseCodexGoalSnapshot(value: unknown): CodexGoalSnapshot {
 	const root = safeObject(value);
 	const goalValue = Object.hasOwn(root, "goal") ? root["goal"] : value;
@@ -96,7 +102,7 @@ export async function readCodexGoalSnapshotInput(
 	try {
 		return parseCodexGoalSnapshot(JSON.parse(trimmed));
 	} catch {
-		const path = resolve(cwd, trimmed);
+		const path = resolve(cwd, normalizeSnapshotPathInput(trimmed));
 		if (!existsSync(path)) {
 			throw new CodexGoalSnapshotError(`Codex goal snapshot is neither valid JSON nor a readable path: ${trimmed}`);
 		}
