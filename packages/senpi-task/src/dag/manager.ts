@@ -638,8 +638,8 @@ function applyRunEvent(record: DagRunRecordV1, event: DagRunEvent): DagRunRecord
   return applyDagRunMutation(record, event)
 }
 
-function nodeFingerprintFromInput(node: DagNodeInput): DagNodeFingerprintInputV1 {
-  return {
+export function nodeFingerprintFromInput(node: DagNodeInput): DagNodeFingerprintInputV1 {
+  const base: DagNodeFingerprintInputV1 = {
     nodeId: node.id as DagNodeId,
     label: node.label ?? node.id,
     dependsOn: (node.dependsOn ?? []) as readonly DagNodeId[],
@@ -651,6 +651,9 @@ function nodeFingerprintFromInput(node: DagNodeInput): DagNodeFingerprintInputV1
     ...(node.description === undefined ? {} : { description: node.description }),
     childName: node.id,
   }
+  if (node.verify === undefined || node.verify.length === 0) return base
+  const verify = node.verify.map((check) => ({ ...check }))
+  return { ...base, verify }
 }
 
 function fingerprintDefinition(definition: DagDefinition): string {

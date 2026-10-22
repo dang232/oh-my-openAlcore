@@ -68,11 +68,13 @@ export type DagStorePaths = {
   readonly runs: string
   readonly events: string
   readonly results: string
+  readonly verifications: string
   readonly locks: string
   readonly key: (parentSessionId: string, runKey: string) => string
   readonly run: (runId: DagRunId) => string
   readonly event: (runId: DagRunId) => string
   readonly result: (runId: DagRunId, nodeId: string) => string
+  readonly verification: (runId: DagRunId, nodeId: string, checkId: string, attempt: number) => string
   readonly runLock: (runId: DagRunId) => string
   readonly keyLock: (parentSessionId: string, runKey: string) => string
   readonly taskOwnerLock: (taskOwner: string) => string
@@ -90,6 +92,9 @@ export type DagFileStore = {
   readonly readKey: (parentSessionId: string, runKey: string) => DagKeyRecord | null
   readonly writeResult: (runId: DagRunId, nodeId: string, result: string) => string
   readonly readResult: (runId: DagRunId, nodeId: string) => string | null
+  readonly writeVerification: (runId: DagRunId, nodeId: string, checkId: string, attempt: number, record: string) => string
+  readonly readVerification: (runId: DagRunId, nodeId: string, checkId: string, attempt: number) => string | null
+  readonly listVerifications: (runId: DagRunId) => readonly string[]
   readonly withRunLock: <T>(runId: DagRunId, operation: () => T) => T
   readonly withKeyLock: <T>(parentSessionId: string, runKey: string, operation: () => T) => T
   readonly withTaskOwnerLock: <T>(taskOwner: string, runId: DagRunId, operation: () => T) => T
@@ -262,6 +267,35 @@ export function createDagFileStore(config: DagStoreConfig, options: StoreOptions
         throw error
       }
     },
+    writeVerification(runId, nodeId, checkId, attempt, record) {
+      assertSafeSegment(runId, "run id")
+      assertSafeSegment(nodeId, "node id")
+      assertSafeSegment(checkId, "check id")
+      const path = paths.verification(runId, nodeId, checkId, attempt)
+      writeFileAtomic(path, record, platform, fsyncWrites)
+      return path
+    },
+    readVerification(runId, nodeId, checkId, attempt) {
+      assertSafeSegment(runId, "run id")
+      assertSafeSegment(nodeId, "node id")
+      assertSafeSegment(checkId, "check id")
+      try {
+        return fs.readFileSync(paths.verification(runId, nodeId, checkId, attempt), "utf8")
+      } catch (error) {
+        if (hasCode(error, "ENOENT")) return null
+        throw error
+      }
+    },
+    listVerifications(runId) {
+      assertSafeSegment(runId, "run id")
+      const names = readDagDirectory(join(paths.verifications, runId))
+      const files: string[] = []
+      for (const entry of names) {
+        if (entry.isFile() && entry.name.endsWith(".json")) files.push(entry.name)
+      }
+      files.sort()
+      return files
+    },
     withRunLock(runId, operation) {
       assertSafeSegment(runId, "run id")
       return withLock(paths.runLock(runId), runId, operation, isProcessAlive, now, fsyncWrites)
@@ -308,6 +342,7 @@ function createPaths(stateDir: string): DagStorePaths {
   const runs = join(root, "runs")
   const events = join(root, "events")
   const results = join(root, "results")
+  const verifications = join(root, "verifications")
   const locks = join(root, "locks")
   return {
     root,
@@ -315,11 +350,14 @@ function createPaths(stateDir: string): DagStorePaths {
     runs,
     events,
     results,
+    verifications,
     locks,
     key: (parentSessionId, runKey) => join(keys, `${dagKeyHash(parentSessionId, runKey)}.json`),
     run: (runId) => join(runs, `${runId}.json`),
     event: (runId) => join(events, `${runId}.jsonl`),
     result: (runId, nodeId) => join(results, runId, `${nodeId}.txt`),
+    verification: (runId, nodeId, checkId, attempt) =>
+      join(verifications, runId, `${nodeId}.${checkId}.${attempt}.json`),
     runLock: (runId) => join(locks, `${runId}.lock`),
     keyLock: (parentSessionId, runKey) => join(locks, `key-${dagKeyHash(parentSessionId, runKey)}.lock`),
     taskOwnerLock: (taskOwner) => join(locks, `task-owner-${sha256(taskOwner)}.lock`),

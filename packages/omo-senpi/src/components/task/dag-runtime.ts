@@ -12,6 +12,7 @@ import {
   createDagManager,
   createDagRecovery,
   createDagWaitSurface,
+  runVerificationCommand,
   type DagDefinition,
   type DagFileStore,
   type DagLeaseWatchOptions,
@@ -24,6 +25,7 @@ import {
   type DagRunRecordV1,
   type DagRunSnapshot,
   type DagScheduler,
+  type DagVerifyRunnerInput,
   type OwnedStartResult,
 } from "@oh-my-opencode/senpi-task/dag"
 
@@ -155,6 +157,12 @@ export function createDagRuntime(deps: DagRuntimeDeps): DagRuntime {
     ...(deps.engine.ancestry === undefined ? {} : { ancestry: deps.engine.ancestry }),
     ...(deps.nodeSpawnPolicy === undefined ? {} : { nodeSpawnPolicy: deps.nodeSpawnPolicy }),
     ...(dagSettings?.subscriber_ring === undefined ? {} : { subscriberRing: dagSettings.subscriber_ring }),
+    // Evidence-first verification: node-declared checks run through the default argv runner
+    // cwd-locked to the engine cwd; run-level checks arrive here (none today). The scheduler
+    // fails closed without a runner, so production runs never complete unverified.
+    verifyRunner: (input: DagVerifyRunnerInput) => runVerificationCommand(input),
+    verifyProjectDir: deps.engine.runtime.cwd(),
+    verifyChecks: [],
   }
 
   const subscribe = (runId: DagRunId, listener: (event: DagRunEvent) => void): (() => void) => {

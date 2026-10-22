@@ -82,6 +82,12 @@ export type TaskToolDeps = {
   // The parent session's ONE resolution of `task.default_execution_mode: "auto"` (the shared-daemon
   // capability check). Absent -> `auto` reads as in-process and the manager decides at spawn.
   readonly executionModeGate?: ExecutionModeGate
+  // Optional project-knowledge provider. The host treats the returned string as opaque untrusted
+  // text: freshness and isolation scoping are the provider's duty, never the host's.
+  readonly resolveProjectKnowledge?: (
+    target: { category: string } | { subagentType: string },
+    cwd: string,
+  ) => string | undefined
 }
 
 export type TaskToolMode = "spawn"

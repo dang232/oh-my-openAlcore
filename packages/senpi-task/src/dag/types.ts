@@ -1,6 +1,7 @@
 // allow: SIZE_OK - single public type contract for the dag subsystem; splitting it would fragment one cohesive domain vocabulary across imports.
 import type { TaskRunStats } from "../state/types"
 import type { TaskTargetErrorCode } from "../tools/task/validation"
+import type { DagVerifyCheck } from "./verification"
 
 export type DagRunId = string & { readonly __brand: "DagRunId" }
 export type DagNodeId = string & { readonly __brand: "DagNodeId" }
@@ -111,6 +112,7 @@ export const DAG_NODE_ERROR_CODES = [
   "resume_task_missing",
   "resume_task_orphaned",
   "journal_corrupt",
+  "verification_failed",
 ] as const
 
 export type DagNodeErrorCode = (typeof DAG_NODE_ERROR_CODES)[number]
@@ -157,6 +159,10 @@ export type DagNode = {
   readonly prompt: string
   readonly route: DagRoute
   readonly dependsOn: readonly DagNodeId[]
+  // Evidence-first verification: checks the engine must run and record after this node
+  // completes, before dependents admit. A failing check fails the node; the identifiers
+  // join the node fingerprint so check changes invalidate.
+  readonly verify?: readonly DagVerifyCheck[]
   readonly state: DagNodeState
   readonly taskId?: string
   readonly attempt: number

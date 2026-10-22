@@ -91,7 +91,7 @@ export type { DagJournal, DagJournalCheckpoint, DagJournalListener, DagJournalOp
 
 // manager.ts and handle.ts both name a `DagRunHandle`. handle.ts's is the superset (it adds done()
 // and cancel()), so it keeps the plain name and the manager's snapshot-only shape is aliased.
-export { createDagManager, DAG_MANAGER_ERROR_CODES, DagManagerError } from "./manager"
+export { createDagManager, DAG_MANAGER_ERROR_CODES, DagManagerError, nodeFingerprintFromInput } from "./manager"
 export type {
   AmendRecord,
   DagHistoryParams,
@@ -131,6 +131,66 @@ export type { DagExecutionModeSources } from "./execution-mode"
 
 export { applyDagSchedulerEvent, createDagScheduler } from "./scheduler"
 export type { DagNodeSpawnPolicy, DagNodeSpawnPolicyVerdict, DagScheduler, DagSchedulerOptions } from "./scheduler"
+
+export {
+  buildVerificationRecord,
+  checkVerificationFreshness,
+  deriveVerificationStatus,
+  evaluateAcceptance,
+  isVerificationAccepting,
+  parseVerificationRecord,
+  readRunVerificationRecords,
+  reconcileInterruptedVerifications,
+  runVerificationCommand,
+  scrubSecretValues,
+  selectVerificationChecks,
+  serializeVerificationRecord,
+  verificationAffectedByRepair,
+  verificationRecordKey,
+  withRecordClassification,
+  DAG_FAILURE_CLASSIFICATIONS,
+  DAG_VERIFICATION_STATUSES,
+  DAG_VERIFY_CHECK_CATEGORIES,
+  VERIFY_RUNNER_OUTPUT_LIMIT_BYTES,
+} from "./verification"
+export type {
+  DagAcceptanceInput,
+  DagAcceptanceRequirement,
+  DagAcceptanceVerdict,
+  DagChangeScope,
+  DagFailureClassification,
+  DagSelectedChecks,
+  DagVerificationCurrent,
+  DagVerificationFreshness,
+  DagVerificationRecord,
+  DagVerificationRecordInput,
+  DagVerificationStatus,
+  DagVerifyCheck,
+  DagVerifyCheckCategory,
+  DagVerifyCommandResult,
+  DagVerifyRunner,
+  DagVerifyRunnerInput,
+  RunVerificationRecords,
+  VerificationRecordStore,
+} from "./verification"
+
+export {
+  classifyCommandResult,
+  decideRepair,
+  emptyRepairState,
+  failureSignature,
+  recordRepairAttempt,
+  repairDagRun,
+  DAG_REPAIR_BUDGET_DEFAULTS,
+} from "./repair"
+export type {
+  DagRepairAttempt,
+  DagRepairBudgets,
+  DagRepairDecision,
+  DagRepairOutcome,
+  DagRepairState,
+  RepairDagRunInput,
+} from "./repair"
 
 export { persistDagNodeResult, readDagNodeResult } from "./results"
 export type {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 
 import type { DagOwnerFingerprintInput } from "./owner"
 import type { DagNodeId, DagRoute } from "./types"
+import type { DagVerifyCheck } from "./verification"
 
 export type DagNodeFingerprintInputV1 = {
   readonly nodeId: DagNodeId
@@ -13,6 +14,8 @@ export type DagNodeFingerprintInputV1 = {
   readonly route: DagRoute
   readonly taskSummary?: string
   readonly description?: string
+  // Evidence-first verification: check changes invalidate the node.
+  readonly verify?: readonly DagVerifyCheck[]
   readonly childName: string
 }
 
@@ -59,7 +62,14 @@ export function dagFingerprint(value: JsonValue): string {
 }
 
 export function nodeFingerprintInput(input: DagNodeFingerprintInputV1): DagNodeFingerprintInputV1 {
-  return { ...input, dependsOn: [...input.dependsOn].sort() }
+  const normalized: DagNodeFingerprintInputV1 = {
+    ...input,
+    dependsOn: [...input.dependsOn].sort(),
+  }
+  if (input.verify === undefined) return normalized
+  const byCheckId = (a: { readonly checkId: string }, b: { readonly checkId: string }): number =>
+    a.checkId < b.checkId ? -1 : a.checkId > b.checkId ? 1 : 0
+  return { ...normalized, verify: [...input.verify].sort(byCheckId) }
 }
 
 export function dagDefinitionFingerprint(input: DagDefinitionFingerprintInputV1): string {

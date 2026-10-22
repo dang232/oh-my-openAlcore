@@ -6,8 +6,9 @@ import { relative } from "node:path"
 import type { ExecutionMode, ManagerStartSpec, ResidencyDenied, TaskManager } from "../manager/types"
 import type { TaskRecord, TaskStatus } from "../state"
 import { resolveDagNodeExecutionMode, type DagExecutionModeSources } from "./execution-mode"
-import { dagFingerprint, ownerFingerprintInput } from "./fingerprint"
+import { dagFingerprint, nodeFingerprintInput, ownerFingerprintInput } from "./fingerprint"
 import {
+  dagDiagnosticAddedEvent,
   dagNodeTaskAttachedEvent,
   dagNodeTransitionedEvent,
   dagRunCancelledEvent,
@@ -18,10 +19,22 @@ import {
   dagWaveStartedEvent,
 } from "./events"
 import { createDagJournal, subscribeDagJournal, type DagJournal, type DagJournalListener } from "./journal"
-import { applyDagRunMutation, skipDuplicateTerminalTransition, type DagMaterializeSkills, type DagPersistedNode, type DagRunRecordV1 } from "./manager"
+import { applyDagRunMutation, nodeFingerprintFromInput, skipDuplicateTerminalTransition, type DagMaterializeSkills, type DagPersistedNode, type DagRunRecordV1 } from "./manager"
 import { retryDagNodes, type DagRetryOptions, type DagRunReentry } from "./node-retry"
 import { sendToDagNode, type DagNodeSendResult } from "./node-send"
 import type { OwnedStartResult } from "./owner"
+import { classifyCommandResult } from "./repair"
+import {
+  buildVerificationRecord,
+  evaluateAcceptance,
+  readRunVerificationRecords,
+  serializeVerificationRecord,
+  verificationRecordKey,
+  withRecordClassification,
+  type DagAcceptanceRequirement,
+  type DagVerifyCheck,
+  type DagVerifyRunner,
+} from "./verification"
 import { persistDagNodeResult, readDagNodeResult, type DagNodeResultArtifact } from "./results"
 import type { DagFileStore } from "./store"
 import { DAG_NODE_OUTPUT_PREVIEW_CHARS } from "./types"
@@ -76,6 +89,14 @@ export type DagSchedulerOptions = {
   readonly hostPid?: number
   readonly isProcessAlive?: (pid: number) => boolean
   readonly now?: () => number
+  // Evidence-first verification: the plan the owner selected, consumed here.
+  // Node checks come from the definition; run-level checks arrive here. Without a
+  // runner, nodes complete exactly like before and the run gate stays open only
+  // when no required check exists: missing records block only checks that were
+  // required, so a run with no plan accepts exactly like today.
+  readonly verifyRunner?: DagVerifyRunner
+  readonly verifyProjectDir?: string
+  readonly verifyChecks?: readonly DagVerifyCheck[]
 }
 
 // Harness-injected gate for agent-routed nodes, evaluated once per admission before startOwned:
@@ -151,6 +172,10 @@ type DagNodeWithResult = DagNode & {
 type SchedulerContext = {
   readonly taskManager: TaskManager
   readonly journal: DagJournal<DagRunRecordV1>
+  readonly store: DagFileStore
+  readonly verifyRunner?: DagVerifyRunner
+  readonly verifyProjectDir?: string
+  readonly verifyChecks: readonly DagVerifyCheck[]
   readonly definitionNodes: ReadonlyMap<DagNodeId, DagPersistedNode>
   readonly executionMode?: Omit<DagExecutionModeSources, "route">
   readonly ancestry?: { readonly depth: number }
@@ -214,6 +239,10 @@ export function createDagScheduler(options: DagSchedulerOptions): DagScheduler {
   const context: SchedulerContext = {
     taskManager: options.taskManager,
     journal,
+    store: options.store,
+    ...(options.verifyRunner === undefined ? {} : { verifyRunner: options.verifyRunner }),
+    ...(options.verifyProjectDir === undefined ? {} : { verifyProjectDir: options.verifyProjectDir }),
+    verifyChecks: options.verifyChecks === undefined ? [] : [...options.verifyChecks],
     definitionNodes: new Map(options.initialRecord.definition.nodes.map((node) => [node.id as DagNodeId, node])),
     ...(options.executionMode === undefined ? {} : { executionMode: options.executionMode }),
     ...(options.ancestry === undefined ? {} : { ancestry: options.ancestry }),
@@ -558,6 +587,11 @@ async function runFrontier(context: SchedulerContext): Promise<DagRunRecordV1> {
   }
 
   const snapshot = context.journal.snapshot()
+  const gateRejection = await evaluateRunGate(context, snapshot)
+  if (gateRejection !== undefined) {
+    context.journal.append(dagRunFailedEvent({ error: gateRejection, counts: countNodes(snapshot.nodes) }))
+    return context.journal.snapshot()
+  }
   const failed = primaryFailure(snapshot)
   if (failed !== undefined) {
     const error = failed.error ?? nodeError(failed.id, "start_failed", "DAG node failed", context.now)
@@ -567,6 +601,108 @@ async function runFrontier(context: SchedulerContext): Promise<DagRunRecordV1> {
   }
   return context.journal.snapshot()
 }
+
+// Run acceptance gate (slice 4): after every node is terminal, run-level
+// checks execute and the gate reads every persisted record — node checks from
+// the fold path plus run checks here. Accepted only when each required record
+// is fresh and passed; anything else fails the run with the named reasons.
+// A run with no required checks accepts exactly like today.
+async function evaluateRunGate(
+  context: SchedulerContext,
+  snapshot: DagRunRecordV1,
+): Promise<DagNodeError | undefined> {
+  const requirements: DagAcceptanceRequirement[] = []
+  for (const node of snapshot.nodes) {
+    const checks = context.definitionNodes.get(node.id)?.verify ?? []
+    for (const check of checks) requirements.push({ check, nodeId: node.id })
+  }
+  for (const check of context.verifyChecks) requirements.push({ check })
+  const runner = context.verifyRunner
+  const projectDir = context.verifyProjectDir
+  if (requirements.length > 0 && (runner === undefined || projectDir === undefined)) {
+    return {
+      code: "verification_failed",
+      message: `verification required (${requirements.length} checks) but no runner is configured`,
+      at: new Date(context.now()).toISOString(),
+    }
+  }
+  const collected = readRunVerificationRecords(context.store, snapshot.runId)
+  const records = new Map(collected.records)
+  const malformed = [...collected.malformed]
+  for (const check of context.verifyChecks) {
+    if (runner === undefined || projectDir === undefined) {
+      return {
+        code: "verification_failed",
+        message: "verification runner unavailable for run-level checks",
+        at: new Date(context.now()).toISOString(),
+      }
+    }
+    if (context.cancellationStarted || context.suspended) {
+      return {
+        code: "verification_failed",
+        message: "verification cancelled before the run gate could complete",
+        at: new Date(context.now()).toISOString(),
+      }
+    }
+    const result = await runner({
+      check,
+      projectDir,
+      attempt: 0,
+      isCancelled: () => context.cancellationStarted,
+    })
+    const built = buildVerificationRecord({
+      runId: snapshot.runId,
+      parentSessionId: snapshot.parentSessionId,
+      rootSessionId: snapshot.rootSessionId,
+      check,
+      cwd: check.cwd ?? projectDir,
+      projectDir,
+      sourceRevision: snapshot.definitionFingerprint,
+      generation: snapshot.generation,
+      repairAttempt: 0,
+      result,
+    })
+    const classified = withRecordClassification(built, classifyCommandResult(result))
+    records.set(verificationRecordKey(undefined, check.checkId), classified)
+    context.store.writeVerification(snapshot.runId, RUN_LEVEL_SEGMENT, check.checkId, 0, serializeVerificationRecord(classified))
+  }
+  const latestAttempts = new Map<string, number>()
+  for (const [key, record] of records) latestAttempts.set(key, record.repairAttempt)
+  const nodeFingerprints = new Map<DagNodeId, string>()
+  for (const node of snapshot.nodes) {
+    const persisted = context.definitionNodes.get(node.id)
+    nodeFingerprints.set(
+      node.id,
+      persisted === undefined
+        ? snapshot.definitionFingerprint
+        : dagFingerprint(nodeFingerprintInput(nodeFingerprintFromInput(persisted))),
+    )
+  }
+  const verdict = evaluateAcceptance({
+    requirements,
+    records,
+    current: {
+      sourceRevision: snapshot.definitionFingerprint,
+      nodeFingerprints,
+      generation: snapshot.generation,
+    },
+    latestAttempts,
+  })
+  const reasons = malformed.map((file) => `malformed verification record: ${file}`)
+  reasons.push(...verdict.reasons)
+  if (reasons.length > 0) {
+    return {
+      code: "verification_failed",
+      message: `run acceptance blocked: ${reasons.join("; ")}`,
+      at: new Date(context.now()).toISOString(),
+    }
+  }
+  return undefined
+}
+
+// Run-level checks persist under a reserved node segment: no node record ever
+// lands here, so run evidence and node evidence cannot overwrite each other.
+const RUN_LEVEL_SEGMENT = "run"
 
 // One admission pass over the frontier: the ordered residency-denied queue first (oldest denial
 // gets the first freed slot), then every newly ready node. startOwned runs as one batch; denials
@@ -877,7 +1013,7 @@ async function settleOne(context: SchedulerContext, residencyReleased?: Promise<
     if (settled.kind === "error") {
       failNode(context, settled.nodeId, "task_error", errorMessage(settled.error))
     } else {
-      foldTaskOutcome(context, settled.nodeId, settled.record)
+      await foldTaskOutcome(context, settled.nodeId, settled.record)
     }
   } finally {
     task?.resolveFolded()
@@ -885,17 +1021,86 @@ async function settleOne(context: SchedulerContext, residencyReleased?: Promise<
   return true
 }
 
-function foldTaskOutcome(context: SchedulerContext, nodeId: DagNodeId, task: TaskRecord): void {
+async function foldTaskOutcome(context: SchedulerContext, nodeId: DagNodeId, task: TaskRecord): Promise<void> {
   if (task.status === "pending" || task.status === "running") {
     throw new Error(`TaskManager.waitFor returned nonterminal task ${task.task_id}`)
   }
   context.pendingTerminalResults.set(nodeId, { record: task })
-  if (task.status === "completed") {
+  if (task.status !== "completed") {
+    const failure = taskFailure(task.status, task.error_message)
+    failNode(context, nodeId, failure.code, failure.message)
+    return
+  }
+  const checks = context.definitionNodes.get(nodeId)?.verify ?? []
+  if (checks.length === 0) {
     transition(context, nodeId, "completed", { kind: "succeeded" })
     return
   }
-  const failure = taskFailure(task.status, task.error_message)
-  failNode(context, nodeId, failure.code, failure.message)
+  const passed = await runNodeVerifications(context, nodeId, checks)
+  if (passed) {
+    transition(context, nodeId, "completed", { kind: "succeeded" })
+    return
+  }
+  failNode(context, nodeId, "verification_failed", `verification failed for node "${nodeId}"`)
+}
+
+// Evidence-first verification (slice 4): a completed worker is a claim, not
+// proof. Each declared check runs through the injected runner and persists
+// its record before the node may complete; a failing check fails the node so
+// dependents skip-cascade and repair owns the next move. Without a runner or
+// project dir the checks cannot execute, and an unexecuted check is not
+// evidence: the node fails closed rather than completing unverified.
+async function runNodeVerifications(
+  context: SchedulerContext,
+  nodeId: DagNodeId,
+  checks: readonly DagVerifyCheck[],
+): Promise<boolean> {
+  const runner = context.verifyRunner
+  const projectDir = context.verifyProjectDir
+  if (runner === undefined || projectDir === undefined) return false
+  const record = context.journal.snapshot()
+  const persisted = context.definitionNodes.get(nodeId)
+  const nodeFingerprint = persisted === undefined
+    ? record.definitionFingerprint
+    : dagFingerprint(nodeFingerprintInput(nodeFingerprintFromInput(persisted)))
+  let passed = true
+  for (const check of checks) {
+    if (context.cancellationStarted || context.suspended) return false
+    const result = await runner({
+      check,
+      projectDir,
+      attempt: 0,
+      isCancelled: () => context.cancellationStarted,
+    })
+    const built = buildVerificationRecord({
+      runId: record.runId,
+      parentSessionId: record.parentSessionId,
+      rootSessionId: record.rootSessionId,
+      nodeId,
+      check,
+      cwd: check.cwd ?? projectDir,
+      projectDir,
+      sourceRevision: record.definitionFingerprint,
+      nodeFingerprint,
+      generation: record.generation,
+      repairAttempt: 0,
+      result,
+    })
+    const classified = withRecordClassification(built, classifyCommandResult(result))
+    context.store.writeVerification(record.runId, nodeId, check.checkId, 0, serializeVerificationRecord(classified))
+    if (classified.status !== "passed") {
+      passed = false
+      context.journal.append(dagDiagnosticAddedEvent({
+        diagnostic: {
+          kind: "node_flag",
+          nodeId,
+          message: `verification ${check.checkId} ${classified.status}`,
+          at: new Date(context.now()).toISOString(),
+        },
+      }))
+    }
+  }
+  return passed
 }
 
 function applyDependentSkipCascade(context: SchedulerContext): void {

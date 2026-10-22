@@ -192,6 +192,7 @@ describe("dag domain types", () => {
       "resume_task_missing",
       "resume_task_orphaned",
       "journal_corrupt",
+      "verification_failed",
     ])
     expect(DAG_NODE_TRANSITION_REASONS).toEqual([
       { kind: "unblocked" },

@@ -76,7 +76,15 @@ export async function runSpawn(
   // The default skill discovery inside buildStartSpec reads the senpi barrel synchronously, so the
   // barrel is warmed here (memoized: a cache hit once the engine barrel is loaded).
   await loadSenpiBarrel()
-  const spec = buildStartSpec(effectiveParams, target, ctx.sessionManager.getSessionId(), deps, ctx.cwd, input.kernelTools)
+  const spec = buildStartSpec(
+    effectiveParams,
+    target,
+    ctx.sessionManager.getSessionId(),
+    deps,
+    ctx.cwd,
+    input.kernelTools,
+    deps.resolveProjectKnowledge?.(target, ctx.cwd),
+  )
   const started = await deps.manager.start(spec)
   if (started.kind === "plan_unresolved") {
     const agents = started.error.availableAgents
